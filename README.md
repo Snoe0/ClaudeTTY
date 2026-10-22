@@ -59,10 +59,6 @@ For the same reason pull requests are turned off on this repo. If you want it to
 
 ## Comparison with others in its space.
 
-<p align="center">
-  <img src="media/perf.svg" width="760" alt="Launch time, memory and app size for ClaudeTTY, cmux, Superset, Warp, Wave and Ghostty">
-</p>
-
 | | ClaudeTTY | cmux | Superset | Warp | Wave | Ghostty |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | Tabs keep running after a quit or crash | ✅ | opt-in, through tmux | ✅ | ❌ | SSH only, opt-in | ❌ |

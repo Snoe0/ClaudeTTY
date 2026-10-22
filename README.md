@@ -56,6 +56,7 @@ For the same reason pull requests are turned off on this repo. If you want it to
     </td>
   </tr>
 </table>
+
 ## Comparison with others in its space.
 
 <p align="center">

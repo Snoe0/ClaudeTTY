@@ -1,0 +1,94 @@
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 8eddc14c8..2a2e09363 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -1807,6 +1807,15 @@ pub fn updateConfig(
+         break :font_size size;
+     });
+ 
++    if (self.config.window_padding_balance == .false) {
++        const content_scale = try self.rt_surface.getContentScale();
++        const padding = self.config.scaledPadding(content_scale.x * font.face.default_dpi, content_scale.y * font.face.default_dpi);
++        if (!std.meta.eql(padding, self.size.padding)) {
++            self.size.padding = padding;
++            try self.resize(self.size.screen);
++        }
++    }
++
+     // We need to store our configs in a heap-allocated pointer so that
+     // our messages aren't huge.
+     var renderer_message = try rendererpkg.Message.initChangeConfig(self.alloc, config);
+@@ -2738,7 +2747,7 @@ pub fn keyCallback(
+         // 1. mouse reporting is off
+         // OR
+         // 2. mouse reporting is on and we are not reporting shift to the terminal
+-        if (self.io.terminal.flags.mouse_event == .none or
++        if (self.io.terminal.flags.mouse_event == .none or self.mouse.mods.super or
+             (self.mouse.mods.shift and !self.mouseShiftCapture(false)))
+         {
+             // Refresh our link state
+@@ -3819,6 +3828,9 @@ pub fn mouseButtonCallback(
+     // bottleneck.
+     const shift_capture = self.mouseShiftCapture(true);
+ 
++    if (button == .left and action == .press and self.mouse.over_link and mods.super and
++        self.io.terminal.flags.mouse_event != .none) return true;
++
+     // Shift-click continues the previous mouse state if we have a selection.
+     // cursorPosCallback will also do a mouse report so we don't need to do any
+     // of the logic below.
+@@ -4627,7 +4639,7 @@ pub fn cursorPosCallback(
+     if ((over_link or
+         self.mouse.link_point == null or
+         (self.mouse.link_point != null and !self.mouse.link_point.?.eql(pos_vp))) and
+-        (self.io.terminal.flags.mouse_event == .none or
++        (self.io.terminal.flags.mouse_event == .none or self.mouse.mods.super or
+             (self.mouse.mods.shift and !self.mouseShiftCapture(false))))
+     {
+         // If we were previously over a link, we always update. We do this so that if the text
+diff --git a/src/config/url.zig b/src/config/url.zig
+index 463ea9bfc..3f39b8071 100644
+--- a/src/config/url.zig
++++ b/src/config/url.zig
+@@ -101,17 +101,22 @@ const bare_relative_path_prefix =
+ ;
+ 
+ const bare_relative_path_branch =
+-    dotted_path_lookahead ++
+     bare_relative_path_prefix ++
+     path_chars ++ "+" ++
+     no_trailing_colon;
+ 
++const bare_name_branch =
++    \\(?<![\w\-.~\/@$])(?:localhost|[\w\-]+(?:\.[\w\-]+)*\.[A-Za-z][\w\-]*)(?::\d+){0,2}(?:\/[\w\-.~:\/?#@!$&*+;=%]*)?
++++ no_trailing_punctuation ++ no_trailing_colon;
++
+ pub const regex =
+     scheme_url_branch ++
+     "|" ++
+     rooted_or_relative_path_branch ++
+     "|" ++
+-    bare_relative_path_branch;
++    bare_relative_path_branch ++
++    "|" ++
++    bare_name_branch;
+ 
+ test "url regex" {
+     const testing = std.testing;
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index 27e06dcb7..4b5fe22ff 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -770,9 +770,10 @@ pub const StreamHandler = struct {
+                 }
+             },
+ 
+-            .mouse_format_utf8 => self.terminal.flags.mouse_format = if (enabled) .utf8 else .x10,
++            .mouse_format_utf8, .mouse_format_urxvt => if (!enabled or (self.terminal.flags.mouse_format != .sgr and self.terminal.flags.mouse_format != .sgr_pixels)) {
++                self.terminal.flags.mouse_format = if (!enabled) .x10 else if (mode == .mouse_format_utf8) .utf8 else .urxvt;
++            },
+             .mouse_format_sgr => self.terminal.flags.mouse_format = if (enabled) .sgr else .x10,
+-            .mouse_format_urxvt => self.terminal.flags.mouse_format = if (enabled) .urxvt else .x10,
+             .mouse_format_sgr_pixels => self.terminal.flags.mouse_format = if (enabled) .sgr_pixels else .x10,
+ 
+             else => {},

@@ -1818,7 +1818,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
                 activities[group] = view
                 return view
             }
-            let row = Row(title(group), icon: pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Pinned") : nil, activity: sparks, detail:place(groupTabs[0].folder), bar: colors.first { $0.name == groupTabs[0].labels["color"] }?.color, selected: group == selected.group, fill: .controlAccentColor,
+            let row = Row(self.title(group), icon: pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Pinned") : nil, activity: sparks, detail:place(groupTabs[0].folder), bar: colors.first { $0.name == groupTabs[0].labels["color"] }?.color, selected: group == selected.group, fill: .controlAccentColor,
                           close: { [unowned self] in closing(group: group) }) { [unowned self] in
                 select(group: group)
             }

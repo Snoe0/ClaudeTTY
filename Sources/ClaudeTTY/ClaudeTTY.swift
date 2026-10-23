@@ -1708,7 +1708,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         }
         let visible = visibleGroups
         let index = target == GHOSTTY_GOTO_TAB_LAST ? visible.count : Int(target.rawValue)
-        guard (1...visible.count).contains(index) else { return }
+        guard visible.indices.contains(index - 1) else { return }
         select(group: visible[index - 1])
     }
 
@@ -1731,9 +1731,10 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
 
     @objc private func switchGroup(_ sender: NSButton) {
         let menu = NSMenu()
+        let visible = visibleGroups
         for group in groups {
             let groupTabs = tabs.filter { $0.group == group }
-            let item = groupItem(group, in: menu)
+            let item = groupItem(group, in: menu, visible: visible)
             item.view = GroupEntry(item, state: status(groupTabs).map { ([$0] + [agents(groupTabs)].compactMap { $0 }).joined(separator: " · ") }, place: place(groupTabs[0].folder),
                                    bar: colors.first { $0.name == groupTabs[0].labels["color"] }?.color)
         }
@@ -1742,8 +1743,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         popUp(menu, at: NSPoint(x: 0, y: sender.bounds.maxY + 6), in: sender)
     }
 
-    @discardableResult private func groupItem(_ group: String, in menu: NSMenu) -> NSMenuItem {
-        let visible = visibleGroups
+    @discardableResult private func groupItem(_ group: String, in menu: NSMenu, visible: [String]) -> NSMenuItem {
         let item = menu.addItem(withTitle: title(group), action: #selector(pickGroup), keyEquivalent: visible.firstIndex(of: group).flatMap { Self.digitKey($0, of: visible.count) } ?? "")
         item.target = self
         item.representedObject = group
@@ -1921,7 +1921,8 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         lookAt()
         if hidden { menuBarIcon() }
         groupsMenu.removeAllItems()
-        for group in groups { groupItem(group, in: groupsMenu) }
+        let visible = visibleGroups
+        for group in groups { groupItem(group, in: groupsMenu, visible: visible) }
         groupsMenu.addItem(.separator())
         let paneTabs = tabs.filter { $0.group == selected.group && pane(of: $0, in: layout) == focused }
         for (index, tab) in paneTabs.enumerated() {
@@ -1974,7 +1975,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         row.lane = inside.first.map(isPinned) == true ? "pinned" : "groups"
         row.dropped = { [unowned self] to in drop(.folder(name), at: to) }
         row.contextMenu = { [unowned self] in folderMenu(name) }
-        row.rename = { [unowned self] in rename(folder: name) }
+        row.rename = { [unowned self] in toggle(folder: name); rename(folder: name) }
         folderRows[name] = row
         return row
     }
@@ -1994,7 +1995,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         case .group(let group):
             let below = place + 1 < entries.count ? entries[place + 1] : nil
             let into: String? = switch place == 0 ? nil : entries[place - 1] {
-            case .folder(let name)?: name
+            case .folder(let name)?: collapsed.contains(name) ? nil : name
             case .group(let other)?: folder(of: other).flatMap { name in folder(of: group) == name || below.flatMap(folder(holding:)) == name ? name : nil }
             case nil: nil
             }
@@ -2345,15 +2346,19 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             item.representedObject = object
             menu.addItem(item)
         }
-        let inside = members(of: name), pinned = isPinned(inside[0])
+        let inside = members(of: name)
+        guard let first = inside.first else { return menu }
+        let pinned = isPinned(first)
         add(collapsed.contains(name) ? "Expand Folder" : "Collapse Folder", #selector(toggleFolder), name)
         add("Rename Folder", #selector(renameFolder), name)
         add(pinned ? "Unpin Folder" : "Pin Folder", #selector(pinGroups), (inside, pinned ? "" : "1"))
         add("-", nil, nil)
         let sorting = UserDefaults.standard.bool(forKey: Self.sortKey)
-        let order = blocks(pinned: pinned), index = order.firstIndex(of: inside)!
-        for (title, to) in [("Move Up", index - 1), ("Move Down", index + 1), ("Move to Top", 0)] {
-            add(title, sorting || to == index || !order.indices.contains(to) ? nil : #selector(moveFolder), (name, to))
+        let order = blocks(pinned: pinned)
+        if let index = order.firstIndex(of: inside) {
+            for (title, to) in [("Move Up", index - 1), ("Move Down", index + 1), ("Move to Top", 0)] {
+                add(title, sorting || to == index || !order.indices.contains(to) ? nil : #selector(moveFolder), (name, to))
+            }
         }
         add("-", nil, nil)
         add("Ungroup Folder", #selector(ungroupFolder), name)
@@ -2385,11 +2390,18 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private func rename(folder name: String) {
         guard let row = folderRows[name] else { return }
         renaming = true
-        row.edit({ text in Self.oneWord(text).isEmpty ? "A folder needs a name." : nil }) { [unowned self] text in
+        row.edit({ [unowned self] text in
+            let new = Self.oneWord(text)
+            if new.isEmpty { return "A folder needs a name." }
+            guard new != name, let other = members(of: new).first, let mine = members(of: name).first, isPinned(other) != isPinned(mine) else { return nil }
+            return isPinned(other) ? "A pinned folder is named \(new)." : "An unpinned folder is named \(new)."
+        }) { [unowned self] text in
             renaming = false
             if let new = text.map(Self.oneWord), !new.isEmpty, new != name {
                 for group in members(of: name) { label(group, "folder", new) }
-                if collapsed.remove(name) != nil { collapsed.insert(new) }
+                let folded = collapsed.remove(name) != nil
+                collapsed.remove(new)
+                if folded { collapsed.insert(new) }
                 saveSoon()
             }
             rebuild()
@@ -2471,7 +2483,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         writeOrder(blocks(pinned: isPinned(group)).flatMap { block -> [String] in
             guard block.contains(group) else { return block }
             var inside = block.filter { $0 != group }
-            inside.insert(group, at: to)
+            inside.insert(group, at: min(to, inside.count))
             return inside
         })
         rebuild()
@@ -2645,6 +2657,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     @objc private func renameSelected() {
         guard let selected else { return }
         if !sidebarShown { toggleSidebar() }
+        if let name = folder(of: selected.group), collapsed.remove(name) != nil { rebuild() }
         rename(selected.group)
     }
 

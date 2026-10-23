@@ -222,6 +222,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private var side: NSView!
     private var sidebarShown = true
     private var zoomed: [String: String] = [:]
+    private var collapsed: Set<String> = []
     private var renaming = false
     private var toggles = 0
     private var sideSlide: NSLayoutConstraint!
@@ -263,7 +264,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         var selected: String?, shown: [String], lastTab: [String: String], zoomed: [String: String], recent: [String]
         var handover: Handover?
         var fullScreen: Bool?, scrolled: [String: UInt64]?
-        var boot: Int?, kept: [Tab]?, resume: [String: String]?, sidebarWidth: CGFloat?
+        var boot: Int?, kept: [Tab]?, resume: [String: String]?, sidebarWidth: CGFloat?, collapsed: [String]?
     }
     private static let stateFile = probe.map { $0 + "/state.json" } ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/ClaudeTTY/state.json").path
     private static let saved = (try? Data(contentsOf: URL(fileURLWithPath: stateFile))).flatMap { try? JSONDecoder().decode(State.self, from: $0) }
@@ -584,6 +585,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         if let saved = Self.saved {
             lastTab = saved.lastTab.compactMapValues { name in tabs.first { $0.name == name } }
             (shown, zoomed, recent) = (Set(saved.shown), saved.zoomed, saved.recent)
+            collapsed = Set(saved.collapsed ?? [])
         }
         readNotices(fresh: false)
         if probe == nil, Bundle.main.bundleIdentifier != nil { UNUserNotificationCenter.current().delegate = self }
@@ -913,7 +915,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
                           lastTab: lastTab.mapValues(\.name), zoomed: zoomed, recent: recent, handover: handover,
                           fullScreen: window.styleMask.contains(.fullScreen), scrolled: surfaces.reduce(into: Self.saved?.scrolled ?? [:]) { $0[$1.key] = $1.value.scrolled }.filter { $0.value > 0 },
                           boot: Self.boot, kept: tabs.map { Tab(name: $0.name, group: $0.group, cwd: $0.folder, labels: $0.labels) },
-                          resume: tabs.reduce(into: [:]) { ids, tab in if tab.claude != nil, let path = tab.transcript { ids[tab.name] = ((path as NSString).lastPathComponent as NSString).deletingPathExtension } }, sidebarWidth: sidebarWidth)
+                          resume: tabs.reduce(into: [:]) { ids, tab in if tab.claude != nil, let path = tab.transcript { ids[tab.name] = ((path as NSString).lastPathComponent as NSString).deletingPathExtension } }, sidebarWidth: sidebarWidth, collapsed: folders.filter(collapsed.contains))
         try? FileManager.default.createDirectory(atPath: (Self.stateFile as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         try? JSONEncoder().encode(state).write(to: URL(fileURLWithPath: Self.stateFile), options: .atomic)
     }
@@ -1304,6 +1306,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     }
 
     private func focus(_ tab: Tab) {
+        if let previous = selected, previous.group != tab.group, let name = folder(of: tab.group) { collapsed.remove(name) }
         selected = tab
         lastTab[tab.group] = tab
         recent.removeAll { $0 == tab.name }
@@ -1783,13 +1786,54 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         if UserDefaults.standard.bool(forKey: Self.sortKey) {
             for tab in tabs { states[tab.group] = min(states[tab.group] ?? 2, ["waiting": 0, "working": 1][tab.claude ?? ""] ?? 2) }
         }
-        return firsts.map { ($0.labels["pinned"] == nil ? 1 : 0, states[$0.group] ?? 2, Int($0.labels["order"] ?? "") ?? .max, $0.group) }
+        let sorted = firsts.map { ($0.labels["pinned"] == nil ? 1 : 0, states[$0.group] ?? 2, Int($0.labels["order"] ?? "") ?? .max, $0.group) }
             .sorted { ($0.0, $0.1, $0.2) < ($1.0, $1.1, $1.2) }.map(\.3)
+        return sorted.reduce(into: [String]()) { clustered, group in
+            guard !clustered.contains(group) else { return }
+            clustered += folder(of: group).map { name in sorted.filter { self.folder(of: $0) == name } } ?? [group]
+        }
     }
 
     private func peers(_ group: String) -> [String] {
         let pinned = { (group: String) in self.tabs.first { $0.group == group }?.labels["pinned"] != nil }
         return groups.filter { pinned($0) == pinned(group) }
+    }
+
+    private enum Entry: Equatable { case folder(String), group(String) }
+
+    private var sidebarEntries: [Entry] {
+        groups.reduce(into: []) { entries, group in
+            guard let name = folder(of: group) else { return entries.append(.group(group)) }
+            if !entries.contains(.folder(name)) { entries.append(.folder(name)) }
+            if !collapsed.contains(name) { entries.append(.group(group)) }
+        }
+    }
+
+    private var visibleGroups: [String] { sidebarEntries.compactMap { entry -> String? in if case .group(let group) = entry { return group }; return nil } }
+
+    private var folders: [String] { sidebarEntries.compactMap { entry -> String? in if case .folder(let name) = entry { return name }; return nil } }
+
+    private func folder(of group: String) -> String? { tabs.first { $0.group == group }?.labels["folder"] }
+
+    private func members(of name: String) -> [String] { groups.filter { folder(of: $0) == name } }
+
+    private func isPinned(_ group: String) -> Bool { tabs.first { $0.group == group }?.labels["pinned"] != nil }
+
+    private func isPinned(_ entry: Entry) -> Bool {
+        switch entry {
+        case .group(let group): return isPinned(group)
+        case .folder(let name): return members(of: name).first.map(isPinned) ?? false
+        }
+    }
+
+    private func blocks(pinned: Bool) -> [[String]] {
+        groups.filter { isPinned($0) == pinned }.reduce(into: []) { blocks, group in
+            if let name = folder(of: group), let last = blocks.last?.last, folder(of: last) == name { blocks[blocks.count - 1].append(group) } else { blocks.append([group]) }
+        }
+    }
+
+    private func writeOrder(_ order: [String]) {
+        for (index, group) in order.enumerated() where tabs.first(where: { $0.group == group })?.labels["order"] != String(index) { label(group, "order", String(index)) }
     }
 
     private func rebuild() {
@@ -2350,7 +2394,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
 
     private func regroup(_ name: String, to group: String) -> Bool {
         let tab = tabs.first { $0.name == name }!, source = tab.group, target = tabs.first { $0.group == group }
-        var wanted = (target?.labels ?? ["named": "0"]).filter { ["color", "pinned", "order", "split", "named"].contains($0.key) }
+        var wanted = (target?.labels ?? ["named": "0"]).filter { ["color", "pinned", "order", "split", "named", "folder"].contains($0.key) }
         wanted["pane"] = target.map { pane(of: tabs.first { $0 == lastTab[group] } ?? $0) }
         wanted["title"] = tab.labels["title"]
         guard label(source, "group", group, tab: name) else { NSSound.beep(); return false }
@@ -2615,7 +2659,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private static func sessions() -> [Tab] {
         let found = list().compactMap { fields -> (Int, Tab)? in
             guard let name = fields["name"], let group = fields["group"] else { return nil }
-            return (Int(fields["created"] ?? "") ?? 0, Tab(name: name, group: group, cwd: URL(string: fields["cwd"] ?? "")?.path ?? NSHomeDirectory(), labels: fields.filter { ["color", "pinned", "order", "split", "pane", "title", "rank", "notify", "named"].contains($0.key) }, pid: fields["pid"].flatMap(Int32.init), topic: try? String(contentsOfFile: statusDir + "/" + name + ".topic", encoding: .utf8)))
+            return (Int(fields["created"] ?? "") ?? 0, Tab(name: name, group: group, cwd: URL(string: fields["cwd"] ?? "")?.path ?? NSHomeDirectory(), labels: fields.filter { ["color", "pinned", "order", "split", "pane", "title", "rank", "notify", "named", "folder"].contains($0.key) }, pid: fields["pid"].flatMap(Int32.init), topic: try? String(contentsOfFile: statusDir + "/" + name + ".topic", encoding: .utf8)))
         }.sorted { $0.0 < $1.0 }.map(\.1)
         let first = Dictionary(found.enumerated().map { ($1.group, $0) }, uniquingKeysWith: { first, _ in first })
         return found.map { (first[$0.group]!, Int($0.labels["rank"] ?? "") ?? .max, $0) }.sorted { ($0.0, $0.1) < ($1.0, $1.1) }.map(\.2)

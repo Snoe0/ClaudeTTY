@@ -837,7 +837,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         }
         if let group = args.first {
             let name = args.count > 1 ? args[1] : group
-            if !tabs.contains(where: { $0.name == name }) { tabs.append(Tab(name: name, group: group, cwd: cwd, labels: ["named": tabs.first { $0.group == group }?.labels["named"] ?? (name == group ? "0" : "1")])) }
+            if !tabs.contains(where: { $0.name == name }) { tabs.append(Tab(name: name, group: group, cwd: cwd, labels: tabs.first { $0.group == group }?.labels.filter { ["color", "pinned", "order", "split", "named", "folder"].contains($0.key) } ?? ["named": name == group ? "0" : "1"])) }
             let command = Array(args.dropFirst(2))
             commands[name] = command.isEmpty ? [] : ["env", "PATH=" + (request["path"] as? String ?? "")] + command
         }

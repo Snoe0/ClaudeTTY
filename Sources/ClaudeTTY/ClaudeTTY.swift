@@ -1962,7 +1962,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         row.contextMenu = { [unowned self] in groupMenu(group, pinned: pinned) }
         row.rename = { [unowned self] in rename(group) }
         row.lane = pinned ? "pinned" : "groups"
-        row.dropped = { [unowned self] to in reorder(group, to: to) }
+        row.dropped = { [unowned self] to in drop(.group(group), at: to) }
         groupRows.append((group, row))
         return row
     }
@@ -1977,6 +1977,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
                       selected: folded && inside.contains(selected.group), fill: Row.pickFill) { [unowned self] in toggle(folder: name) }
         row.clicksOnRelease = true
         row.lane = inside.first.map(isPinned) == true ? "pinned" : "groups"
+        row.dropped = { [unowned self] to in drop(.folder(name), at: to) }
         folderRows[name] = row
         return row
     }
@@ -1985,6 +1986,35 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         if collapsed.remove(name) == nil { collapsed.insert(name) }
         saveSoon()
         rebuild()
+    }
+
+    private func drop(_ entry: Entry, at place: Int) {
+        let pinned = isPinned(entry)
+        var entries = sidebarEntries.filter { isPinned($0) == pinned && $0 != entry }
+        let place = min(place, entries.count)
+        entries.insert(entry, at: place)
+        switch entry {
+        case .group(let group):
+            let into = place == 0 ? nil : folder(holding: entries[place - 1])
+            if folder(of: group) != into { label(group, "folder", into ?? "") }
+        case .folder(let name):
+            let inside = members(of: name)
+            entries.removeAll { if case .group(let group) = $0 { return inside.contains(group) }; return false }
+        }
+        writeOrder(entries.flatMap { item -> [String] in
+            switch item {
+            case .group(let group): return [group]
+            case .folder(let name): return item == entry || collapsed.contains(name) ? members(of: name) : []
+            }
+        }.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } })
+        rebuild()
+    }
+
+    private func folder(holding entry: Entry) -> String? {
+        switch entry {
+        case .folder(let name): return name
+        case .group(let group): return folder(of: group)
+        }
     }
 
     private func place(_ folder: String) -> String {

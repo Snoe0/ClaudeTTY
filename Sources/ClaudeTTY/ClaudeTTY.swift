@@ -1974,6 +1974,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
                       bar: shades.count == 1 ? colors.first { $0.name == shades.first }?.color : nil,
                       selected: folded && inside.contains(selected.group), fill: Row.pickFill) { [unowned self] in toggle(folder: name) }
         row.clicksOnRelease = true
+        row.renamesOnTitle = true
         row.lane = inside.first.map(isPinned) == true ? "pinned" : "groups"
         row.dropped = { [unowned self] to in drop(.folder(name), at: to) }
         row.contextMenu = { [unowned self] in folderMenu(name) }
@@ -3652,6 +3653,7 @@ final class Row: NSView, NSTextFieldDelegate {
     var merged: ((Row) -> Void)?
     var mergeable = false
     var clicksOnRelease = false
+    var renamesOnTitle = false
     private var dragged = false
     static var lifted: Row?
     var ghost: NSImageView?
@@ -3776,7 +3778,9 @@ final class Row: NSView, NSTextFieldDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func mouseDown(with event: NSEvent) {
-        guard event.clickCount == 2, let rename else {
+        if let editor = window?.firstResponder as? NSTextView, (editor.delegate as? NSTextField)?.delegate is Row { window?.makeFirstResponder(nil) }
+        let onTitle = !renamesOnTitle || titleLabel.convert(titleLabel.bounds, to: self).contains(convert(event.locationInWindow, from: nil))
+        guard event.clickCount == 2, onTitle, let rename else {
             if clicksOnRelease {
                 dragged = false
                 drag(from: event)

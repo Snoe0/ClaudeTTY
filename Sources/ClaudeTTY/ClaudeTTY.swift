@@ -1799,11 +1799,6 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         }
     }
 
-    private func peers(_ group: String) -> [String] {
-        let pinned = { (group: String) in self.tabs.first { $0.group == group }?.labels["pinned"] != nil }
-        return groups.filter { pinned($0) == pinned(group) }
-    }
-
     private enum Entry: Equatable { case folder(String), group(String) }
 
     private var sidebarEntries: [Entry] {
@@ -1978,6 +1973,8 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         row.clicksOnRelease = true
         row.lane = inside.first.map(isPinned) == true ? "pinned" : "groups"
         row.dropped = { [unowned self] to in drop(.folder(name), at: to) }
+        row.contextMenu = { [unowned self] in folderMenu(name) }
+        row.rename = { [unowned self] in rename(folder: name) }
         folderRows[name] = row
         return row
     }
@@ -2302,14 +2299,114 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         showWindow()
     }
 
+    private func folderItem(_ group: String, filed: String?, pinned: Bool) -> NSMenuItem {
+        let item = NSMenuItem(title: "Move to Folder", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Move to Folder")
+        for name in folders where members(of: name).first.map(isPinned) == pinned {
+            let entry = submenu.addItem(withTitle: name, action: name == filed ? nil : #selector(fileGroup), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = (group, name)
+            entry.state = name == filed ? .on : .off
+        }
+        if !submenu.items.isEmpty { submenu.addItem(.separator()) }
+        for (title, action) in [("New Folder…", #selector(newFolder)), ("Remove from Folder", filed == nil ? nil : #selector(unfileGroup))] as [(String, Selector?)] {
+            let entry = submenu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = group
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func fileGroup(_ item: NSMenuItem) {
+        let (group, name) = item.representedObject as! (String, String)
+        label(group, "folder", name)
+        rebuild()
+    }
+
+    @objc private func unfileGroup(_ item: NSMenuItem) {
+        label(item.representedObject as! String, "folder", "")
+        rebuild()
+    }
+
+    @objc private func newFolder(_ item: NSMenuItem) {
+        let name = Self.unused("Folder", Set(folders))
+        label(item.representedObject as! String, "folder", name)
+        collapsed.remove(name)
+        rebuild()
+        rename(folder: name)
+    }
+
+    private func folderMenu(_ name: String) -> NSMenu {
+        let menu = NSMenu()
+        let add = { (title: String, action: Selector?, object: Any?) in
+            let item = title == "-" ? NSMenuItem.separator() : NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = object
+            menu.addItem(item)
+        }
+        let inside = members(of: name), pinned = isPinned(inside[0])
+        add(collapsed.contains(name) ? "Expand Folder" : "Collapse Folder", #selector(toggleFolder), name)
+        add("Rename Folder", #selector(renameFolder), name)
+        add(pinned ? "Unpin Folder" : "Pin Folder", #selector(pinGroups), (inside, pinned ? "" : "1"))
+        add("-", nil, nil)
+        let sorting = UserDefaults.standard.bool(forKey: Self.sortKey)
+        let order = blocks(pinned: pinned), index = order.firstIndex(of: inside)!
+        for (title, to) in [("Move Up", index - 1), ("Move Down", index + 1), ("Move to Top", 0)] {
+            add(title, sorting || to == index || !order.indices.contains(to) ? nil : #selector(moveFolder), (name, to))
+        }
+        add("-", nil, nil)
+        add("Ungroup Folder", #selector(ungroupFolder), name)
+        add("Close Folder", #selector(closeFolder), name)
+        return menu
+    }
+
+    @objc private func toggleFolder(_ item: NSMenuItem) { toggle(folder: item.representedObject as! String) }
+
+    @objc private func renameFolder(_ item: NSMenuItem) { rename(folder: item.representedObject as! String) }
+
+    @objc private func moveFolder(_ item: NSMenuItem) {
+        let (name, to) = item.representedObject as! (String, Int)
+        move(block: members(of: name), to: to)
+    }
+
+    @objc private func ungroupFolder(_ item: NSMenuItem) {
+        let name = item.representedObject as! String
+        for group in members(of: name) { label(group, "folder", "") }
+        collapsed.remove(name)
+        rebuild()
+    }
+
+    @objc private func closeFolder(_ item: NSMenuItem) {
+        let name = item.representedObject as! String, inside = members(of: name)
+        closing(tabs.filter { inside.contains($0.group) }.map(\.name), title: "Close folder \u{201C}\(name)\u{201D}?", ask: true)
+    }
+
+    private func rename(folder name: String) {
+        guard let row = folderRows[name] else { return }
+        renaming = true
+        row.edit({ text in Self.oneWord(text).isEmpty ? "A folder needs a name." : nil }) { [unowned self] text in
+            renaming = false
+            if let new = text.map(Self.oneWord), !new.isEmpty, new != name {
+                for group in members(of: name) { label(group, "folder", new) }
+                if collapsed.remove(name) != nil { collapsed.insert(new) }
+                saveSoon()
+            }
+            rebuild()
+            window.makeFirstResponder(selected.flatMap { surfaces[$0.name] })
+        }
+    }
+
     private func groupMenu(_ group: String, pinned: Bool) -> NSMenu {
         let menu = NSMenu()
-        let pin = menu.addItem(withTitle: pinned ? "Unpin Group" : "Pin Group", action: #selector(setLabel), keyEquivalent: "")
+        let filed = folder(of: group)
+        let pin = menu.addItem(withTitle: (pinned ? "Unpin " : "Pin ") + (filed == nil ? "Group" : "Folder"), action: #selector(pinGroups), keyEquivalent: "")
         pin.target = self
-        pin.representedObject = [group, "pinned", pinned ? "" : "1"]
+        pin.representedObject = (filed.map { members(of: $0) } ?? [group], pinned ? "" : "1")
         let rename = menu.addItem(withTitle: "Rename Group", action: #selector(renameGroup), keyEquivalent: "R")
         rename.target = self
         rename.representedObject = group
+        menu.addItem(folderItem(group, filed: filed, pinned: pinned))
         menu.addItem(.separator())
         let current = tabs.first { $0.group == group }?.labels["color"]
         let circles = NSStackView(views: ([("none", nil)] + colors.map { ($0.name, Optional($0.color)) }).enumerated().map { index, choice in
@@ -2328,10 +2425,10 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         colorItem.representedObject = group
         menu.addItem(.separator())
         let sorting = UserDefaults.standard.bool(forKey: Self.sortKey)
-        let order = peers(group)
+        let order = filed.map { members(of: $0) } ?? blocks(pinned: pinned).map { $0[0] }
         let index = order.firstIndex(of: group)!
         for (title, to) in [("Move Up", index - 1), ("Move Down", index + 1), ("Move to Top", 0)] {
-            let item = menu.addItem(withTitle: title, action: sorting || to == index || !order.indices.contains(to) ? nil : #selector(move), keyEquivalent: "")
+            let item = menu.addItem(withTitle: title, action: sorting || to == index || !order.indices.contains(to) ? nil : #selector(move(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = (group, to)
         }
@@ -2360,13 +2457,29 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
 
     @objc private func move(_ item: NSMenuItem) {
         let (group, to) = item.representedObject as! (String, Int)
-        reorder(group, to: to)
+        folder(of: group) == nil ? move(block: [group], to: to) : move(member: group, to: to)
     }
 
-    private func reorder(_ group: String, to: Int) {
-        var order = peers(group).filter { $0 != group }
-        order.insert(group, at: to)
-        for (index, peer) in order.enumerated() where tabs.first(where: { $0.group == peer })?.labels["order"] != String(index) { label(peer, "order", String(index)) }
+    private func move(block: [String], to: Int) {
+        var all = blocks(pinned: isPinned(block[0])).filter { $0 != block }
+        all.insert(block, at: to)
+        writeOrder(all.flatMap { $0 })
+        rebuild()
+    }
+
+    private func move(member group: String, to: Int) {
+        writeOrder(blocks(pinned: isPinned(group)).flatMap { block -> [String] in
+            guard block.contains(group) else { return block }
+            var inside = block.filter { $0 != group }
+            inside.insert(group, at: to)
+            return inside
+        })
+        rebuild()
+    }
+
+    @objc private func pinGroups(_ item: NSMenuItem) {
+        let (names, value) = item.representedObject as! ([String], String)
+        for name in names { label(name, "pinned", value) }
         rebuild()
     }
 
@@ -2509,12 +2622,6 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             }
             return true
         }
-    }
-
-    @objc private func setLabel(_ item: NSMenuItem) {
-        let label = item.representedObject as! [String]
-        self.label(label[0], label[1], label[2])
-        rebuild()
     }
 
     @discardableResult private func label(_ group: String, _ key: String, _ value: String, tab: String? = nil) -> Bool {

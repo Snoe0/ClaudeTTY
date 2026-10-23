@@ -1959,6 +1959,8 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         row.rename = { [unowned self] in rename(group) }
         row.lane = pinned ? "pinned" : "groups"
         row.dropped = { [unowned self] to in drop(.group(group), at: to) }
+        row.mergeable = folder(of: group) == nil
+        row.merged = { [unowned self] target in groupRows.first { $0.row === target }.map { merge(group, into: $0.group) } }
         groupRows.append((group, row))
         return row
     }
@@ -2011,6 +2013,19 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             }
         }.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } })
         rebuild()
+    }
+
+    private func merge(_ group: String, into target: String) {
+        guard group != target, folder(of: target) == nil, isPinned(group) == isPinned(target) else { return }
+        let name = Self.unused("Folder", Set(folders))
+        var order = groups.filter { isPinned($0) == isPinned(target) && $0 != group }
+        order.insert(group, at: order.firstIndex(of: target)! + 1)
+        label(target, "folder", name)
+        label(group, "folder", name)
+        writeOrder(order)
+        collapsed.remove(name)
+        rebuild()
+        rename(folder: name)
     }
 
     private func folder(holding entry: Entry) -> String? {
@@ -3634,6 +3649,8 @@ final class Row: NSView, NSTextFieldDelegate {
     var lane: String?
     var dropped: ((Int) -> Void)?
     var carried: ((NSPoint) -> Bool)?
+    var merged: ((Row) -> Void)?
+    var mergeable = false
     var clicksOnRelease = false
     private var dragged = false
     static var lifted: Row?
@@ -3787,10 +3804,10 @@ final class Row: NSView, NSTextFieldDelegate {
         let band = { (past: Double) in half * past / (past + half * 3) }
         let origin = along(stack.convert(NSPoint.zero, to: nil))
         var place = from, point = down.locationInWindow, out = false
-        var over: Row?
-        var tick: Date?
+        var over: Row?, held: Row?, merging = false
+        var tick: Date?, due: Date?, heldAt = point
         while true {
-            let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp], until: tick ?? .distantFuture, inMode: .eventTracking, dequeue: true)
+            let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp], until: [tick, due].compactMap { $0 }.min() ?? .distantFuture, inMode: .eventTracking, dequeue: true)
             point = event?.locationInWindow ?? point
             guard event?.type != .leftMouseUp else { break }
             let drift = along(stack.convert(NSPoint.zero, to: nil)) - origin
@@ -3835,7 +3852,10 @@ final class Row: NSView, NSTextFieldDelegate {
                 let point = stack.convert(vertical ? NSPoint(x: centre.x, y: -(at + drift)) : NSPoint(x: at + drift, y: centre.y), from: nil)
                 ghost!.frame = NSRect(x: point.x - bounds.width / 2, y: point.y - bounds.height / 2, width: bounds.width, height: bounds.height)
             }
-            let target = (out ? under : nil).flatMap { sequence(first: $0, next: \.superview).lazy.compactMap { $0 as? Row }.first { $0.detail != nil && !$0.isAccessibilitySelected() } }
+            let aim = merged == nil || out ? nil : rows.lazy.compactMap { $0 as? Row }.first { $0 !== self && $0.mergeable && $0.frame.contains(NSPoint(x: self.ghost!.frame.midX, y: self.ghost!.frame.midY)) }
+            if aim !== held || hypot(point.x - heldAt.x, point.y - heldAt.y) > 4 { (held, heldAt, due, merging) = (aim, point, aim.map { _ in Date() + 0.5 }, false) }
+            if let deadline = due, deadline <= Date() { (due, merging) = (nil, true) }
+            let target = merging ? held : (out ? under : nil).flatMap { sequence(first: $0, next: \.superview).lazy.compactMap { $0 as? Row }.first { $0.detail != nil && !$0.isAccessibilitySelected() } }
             if target !== over {
                 over?.layer?.borderWidth = 0
                 target?.layer?.borderWidth = 2
@@ -3857,7 +3877,7 @@ final class Row: NSView, NSTextFieldDelegate {
             self.ghost = nil
             alphaValue = 1
             Row.lifted = nil
-            dropped?(place)
+            if merging, let held { merged?(held) } else { dropped?(place) }
         }
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = slide

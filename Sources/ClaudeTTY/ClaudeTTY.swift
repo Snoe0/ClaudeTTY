@@ -250,8 +250,6 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private var pills: [KeyPill] = []
     private var paneRows: [Row] = []
     private var groupRows: [(group: String, row: Row)] = []
-    private var undoItem: NSMenuItem?
-    private var undoMerge: (() -> Void)?
     private var folderRows: [String: Row] = [:]
     private static let folderIndent: CGFloat = 12
     private var hintModifier = "⌘"
@@ -2031,10 +2029,8 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             collapsed.remove(name)
             rebuild()
         }
-        rename(folder: name)
-        offerUndo { [unowned self] in
-            window.makeFirstResponder(nil)
-            guard let joined = folder(of: target), folder(of: group) == joined else { return }
+        rename(folder: name) { [unowned self] in
+            guard let joined = folder(of: target), folder(of: group) == joined else { return rebuild() }
             slide {
                 label(target, "folder", "")
                 label(group, "folder", left ?? "")
@@ -2070,26 +2066,6 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             }
         }
         CATransaction.commit()
-    }
-
-    private func offerUndo(_ undo: @escaping () -> Void) {
-        withdrawUndo()
-        let item = NSMenuItem(title: "Undo New Folder", action: #selector(performUndo), keyEquivalent: "z")
-        item.target = self
-        NSApp.mainMenu?.items.first { $0.submenu?.title == "Edit" }?.submenu?.insertItem(item, at: 0)
-        (undoItem, undoMerge) = (item, undo)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak item] in if let item, self?.undoItem === item { self?.withdrawUndo() } }
-    }
-
-    private func withdrawUndo() {
-        undoItem?.menu?.removeItem(undoItem!)
-        (undoItem, undoMerge) = (nil, nil)
-    }
-
-    @objc private func performUndo() {
-        let undo = undoMerge
-        withdrawUndo()
-        undo?()
     }
 
     private func folder(holding entry: Entry) -> String? {
@@ -2410,11 +2386,14 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     }
 
     @objc private func newFolder(_ item: NSMenuItem) {
-        let name = Self.unused("Folder", Set(folders))
-        label(item.representedObject as! String, "folder", name)
+        let group = item.representedObject as! String, name = Self.unused("Folder", Set(folders)), left = folder(of: group)
+        label(group, "folder", name)
         collapsed.remove(name)
         rebuild()
-        rename(folder: name)
+        rename(folder: name) { [unowned self] in
+            label(group, "folder", left ?? "")
+            rebuild()
+        }
     }
 
     private func folderMenu(_ name: String) -> NSMenu {
@@ -2466,7 +2445,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         closing(tabs.filter { inside.contains($0.group) }.map(\.name), title: "Close folder \u{201C}\(name)\u{201D}?", ask: true)
     }
 
-    private func rename(folder name: String) {
+    private func rename(folder name: String, untouched: (() -> Void)? = nil) {
         guard let row = folderRows[name] else { return }
         renaming = true
         row.edit({ [unowned self] text in
@@ -2476,14 +2455,18 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             return isPinned(other) ? "A pinned folder is named \(new)." : "An unpinned folder is named \(new)."
         }) { [unowned self] text in
             renaming = false
-            if let new = text.map(Self.oneWord), !new.isEmpty, new != name {
-                for group in members(of: name) { label(group, "folder", new) }
-                let folded = collapsed.remove(name) != nil
-                collapsed.remove(new)
-                if folded { collapsed.insert(new) }
-                saveSoon()
+            if text == nil, !row.typed, let untouched {
+                untouched()
+            } else {
+                if let new = text.map(Self.oneWord), !new.isEmpty, new != name {
+                    for group in members(of: name) { label(group, "folder", new) }
+                    let folded = collapsed.remove(name) != nil
+                    collapsed.remove(new)
+                    if folded { collapsed.insert(new) }
+                    saveSoon()
+                }
+                rebuild()
             }
-            rebuild()
             window.makeFirstResponder(selected.flatMap { surfaces[$0.name] })
         }
     }
@@ -3717,6 +3700,7 @@ final class Row: NSView, NSTextFieldDelegate {
     var mergeable = false
     var clicksOnRelease = false
     var renamesOnTitle = false
+    private(set) var typed = false
     private var dragged = false
     static var lifted: Row?
     var ghost: NSImageView?
@@ -3971,6 +3955,7 @@ final class Row: NSView, NSTextFieldDelegate {
     func edit(_ problem: @escaping (String) -> String?, done: @escaping (String?) -> Void) {
         self.problem = problem
         renamed = done
+        typed = false
         titleLabel.isEditable = true
         titleLabel.delegate = self
         if detail != nil {
@@ -3984,6 +3969,7 @@ final class Row: NSView, NSTextFieldDelegate {
     }
 
     func controlTextDidChange(_ obj: Notification) {
+        typed = true
         detailLabel?.stringValue = problem?(titleLabel.stringValue) ?? detail ?? ""
         fitTyped()
     }

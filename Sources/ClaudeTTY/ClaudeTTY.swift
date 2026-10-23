@@ -3950,7 +3950,9 @@ final class Spark: NSButton {
     let lines = ["at \(Int(anchor.x)) \(Int(anchor.y))"] + menu.items.map { item in
         if item.isSeparatorItem { return "-" }
         if let view = item.view, !view.subviews.isEmpty { return view.subviews.map { "button " + ($0.accessibilityLabel() ?? "") }.joined(separator: "\n") }
+        item.submenu?.update()
         return item.title + (item.keyEquivalent.isEmpty ? "" : " ⌘" + item.keyEquivalent) + (item.state == .on ? " ✓" : "") + (item.isEnabled ? "" : " (off)") + (item.subtitle.map { " [\($0)]" } ?? "")
+            + (item.submenu.map { " ▸ " + $0.items.map { $0.isSeparatorItem ? "-" : $0.title + ($0.state == .on ? " ✓" : "") + ($0.isEnabled ? "" : " (off)") }.joined(separator: " | ") } ?? "")
     }
     try? lines.joined(separator: "\n").write(toFile: probe + "/menu", atomically: true, encoding: .utf8)
     let views = menu.items.compactMap { item in item.view is GroupEntry ? item.view : item.attributedTitle.map { text in
@@ -3982,7 +3984,9 @@ final class Spark: NSButton {
     }
     guard let pick = try? String(contentsOfFile: probe + "/pick", encoding: .utf8).trimmingCharacters(in: .newlines) else { return true }
     try? FileManager.default.removeItem(atPath: probe + "/pick")
-    if let index = menu.items.firstIndex(where: { $0.title == pick && $0.isEnabled }) { menu.performActionForItem(at: index) }
+    let path = pick.components(separatedBy: "\t")
+    let target = path.dropLast().reduce(Optional(menu)) { menu, title in menu?.items.first { $0.title == title }?.submenu } ?? menu
+    if let index = target.items.firstIndex(where: { $0.title == path.last && $0.isEnabled }) { target.performActionForItem(at: index) }
     (menu.items.compactMap(\.view).flatMap(\.subviews).first { $0.accessibilityLabel() == pick } as? NSButton)?.performClick(nil)
     return true
 }

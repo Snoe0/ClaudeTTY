@@ -222,6 +222,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private var side: NSView!
     private var sidebarShown = true
     private var zoomed: [String: String] = [:]
+    private var collapsed: Set<String> = []
     private var renaming = false
     private var toggles = 0
     private var sideSlide: NSLayoutConstraint!
@@ -248,6 +249,9 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private var hintTimer: Timer?
     private var pills: [KeyPill] = []
     private var paneRows: [Row] = []
+    private var groupRows: [(group: String, row: Row)] = []
+    private var folderRows: [String: Row] = [:]
+    private static let folderIndent: CGFloat = 12
     private var hintModifier = "⌘"
     private static let port = "dev.claudetty.app" + (probe.map { "." + $0 } ?? "") as CFString
     private static var server: CFMessagePort?
@@ -263,7 +267,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         var selected: String?, shown: [String], lastTab: [String: String], zoomed: [String: String], recent: [String]
         var handover: Handover?
         var fullScreen: Bool?, scrolled: [String: UInt64]?
-        var boot: Int?, kept: [Tab]?, resume: [String: String]?, sidebarWidth: CGFloat?
+        var boot: Int?, kept: [Tab]?, resume: [String: String]?, sidebarWidth: CGFloat?, collapsed: [String]?
     }
     private static let stateFile = probe.map { $0 + "/state.json" } ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Application Support/ClaudeTTY/state.json").path
     private static let saved = (try? Data(contentsOf: URL(fileURLWithPath: stateFile))).flatMap { try? JSONDecoder().decode(State.self, from: $0) }
@@ -584,6 +588,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         if let saved = Self.saved {
             lastTab = saved.lastTab.compactMapValues { name in tabs.first { $0.name == name } }
             (shown, zoomed, recent) = (Set(saved.shown), saved.zoomed, saved.recent)
+            collapsed = Set(saved.collapsed ?? [])
         }
         readNotices(fresh: false)
         if probe == nil, Bundle.main.bundleIdentifier != nil { UNUserNotificationCenter.current().delegate = self }
@@ -832,7 +837,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         }
         if let group = args.first {
             let name = args.count > 1 ? args[1] : group
-            if !tabs.contains(where: { $0.name == name }) { tabs.append(Tab(name: name, group: group, cwd: cwd, labels: ["named": tabs.first { $0.group == group }?.labels["named"] ?? (name == group ? "0" : "1")])) }
+            if !tabs.contains(where: { $0.name == name }) { tabs.append(Tab(name: name, group: group, cwd: cwd, labels: tabs.first { $0.group == group }?.labels.filter { ["color", "pinned", "order", "split", "named", "folder"].contains($0.key) } ?? ["named": name == group ? "0" : "1"])) }
             let command = Array(args.dropFirst(2))
             commands[name] = command.isEmpty ? [] : ["env", "PATH=" + (request["path"] as? String ?? "")] + command
         }
@@ -913,7 +918,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
                           lastTab: lastTab.mapValues(\.name), zoomed: zoomed, recent: recent, handover: handover,
                           fullScreen: window.styleMask.contains(.fullScreen), scrolled: surfaces.reduce(into: Self.saved?.scrolled ?? [:]) { $0[$1.key] = $1.value.scrolled }.filter { $0.value > 0 },
                           boot: Self.boot, kept: tabs.map { Tab(name: $0.name, group: $0.group, cwd: $0.folder, labels: $0.labels) },
-                          resume: tabs.reduce(into: [:]) { ids, tab in if tab.claude != nil, let path = tab.transcript { ids[tab.name] = ((path as NSString).lastPathComponent as NSString).deletingPathExtension } }, sidebarWidth: sidebarWidth)
+                          resume: tabs.reduce(into: [:]) { ids, tab in if tab.claude != nil, let path = tab.transcript { ids[tab.name] = ((path as NSString).lastPathComponent as NSString).deletingPathExtension } }, sidebarWidth: sidebarWidth, collapsed: folders.filter(collapsed.contains))
         try? FileManager.default.createDirectory(atPath: (Self.stateFile as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
         try? JSONEncoder().encode(state).write(to: URL(fileURLWithPath: Self.stateFile), options: .atomic)
     }
@@ -1049,7 +1054,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             let tip = (view as? NSButton).flatMap { button in button.action.map(actions.contains) == true ? button.toolTip : nil }
             return (tip.map { [(String($0[$0.lastIndex(of: "(")!...].dropFirst().dropLast()), view)] } ?? []) + view.subviews.flatMap(buttons)
         }
-        let rows = sidebar.views.enumerated().compactMap { index, row in Self.digitKey(index, of: groups.count).map { ("⌘" + $0, row, true) } }
+        let rows = groupRows.enumerated().compactMap { index, entry in Self.digitKey(index, of: groupRows.count).map { ("⌘" + $0, entry.row as NSView, true) } }
         let tabKeys = paneRows.enumerated().compactMap { index, row in Self.digitKey(index, of: paneRows.count).map { ("⌃" + $0, row as NSView, false) } }
         let targets = hintModifier == "⌃" ? tabKeys : buttons(root).map { ($0, $1, false) } + rows
         let topDown = targets.filter { !$0.1.isHiddenOrHasHiddenAncestor && !$0.1.visibleRect.isEmpty }.map { key, view, corner in
@@ -1218,7 +1223,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         tint.layer?.backgroundColor = NSColor(white: 0, alpha: 0.18).cgColor
         side.addSubview(tint)
         sidebar.orientation = .vertical
-        sidebar.alignment = .leading
+        sidebar.alignment = .trailing
         sidebar.spacing = 4
         tabBar.spacing = 2
         tabBar.alignment = .firstBaseline
@@ -1304,6 +1309,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     }
 
     private func focus(_ tab: Tab) {
+        if let previous = selected, previous.group != tab.group, let name = folder(of: tab.group) { collapsed.remove(name) }
         selected = tab
         lastTab[tab.group] = tab
         recent.removeAll { $0 == tab.name }
@@ -1700,9 +1706,10 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             let index = paneTabs.firstIndex(of: selected)! + (target == GHOSTTY_GOTO_TAB_NEXT ? 1 : paneTabs.count - 1)
             return select(paneTabs[index % paneTabs.count])
         }
-        let index = target == GHOSTTY_GOTO_TAB_LAST ? groups.count : Int(target.rawValue)
-        guard (1...groups.count).contains(index) else { return }
-        select(group: groups[index - 1])
+        let visible = visibleGroups
+        let index = target == GHOSTTY_GOTO_TAB_LAST ? visible.count : Int(target.rawValue)
+        guard visible.indices.contains(index - 1) else { return }
+        select(group: visible[index - 1])
     }
 
     private func select(group: String) { select(lastTab[group] ?? tabs.first { $0.group == group }!) }
@@ -1724,9 +1731,10 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
 
     @objc private func switchGroup(_ sender: NSButton) {
         let menu = NSMenu()
-        for (index, group) in groups.enumerated() {
+        let visible = visibleGroups
+        for group in groups {
             let groupTabs = tabs.filter { $0.group == group }
-            let item = groupItem(group, at: index, in: menu)
+            let item = groupItem(group, in: menu, visible: visible)
             item.view = GroupEntry(item, state: status(groupTabs).map { ([$0] + [agents(groupTabs)].compactMap { $0 }).joined(separator: " · ") }, place: place(groupTabs[0].folder),
                                    bar: colors.first { $0.name == groupTabs[0].labels["color"] }?.color)
         }
@@ -1735,8 +1743,8 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         popUp(menu, at: NSPoint(x: 0, y: sender.bounds.maxY + 6), in: sender)
     }
 
-    @discardableResult private func groupItem(_ group: String, at index: Int, in menu: NSMenu) -> NSMenuItem {
-        let item = menu.addItem(withTitle: title(group), action: #selector(pickGroup), keyEquivalent: Self.digitKey(index, of: groups.count) ?? "")
+    @discardableResult private func groupItem(_ group: String, in menu: NSMenu, visible: [String]) -> NSMenuItem {
+        let item = menu.addItem(withTitle: title(group), action: #selector(pickGroup), keyEquivalent: visible.firstIndex(of: group).flatMap { Self.digitKey($0, of: visible.count) } ?? "")
         item.target = self
         item.representedObject = group
         item.state = group == selected?.group ? .on : .off
@@ -1783,13 +1791,49 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         if UserDefaults.standard.bool(forKey: Self.sortKey) {
             for tab in tabs { states[tab.group] = min(states[tab.group] ?? 2, ["waiting": 0, "working": 1][tab.claude ?? ""] ?? 2) }
         }
-        return firsts.map { ($0.labels["pinned"] == nil ? 1 : 0, states[$0.group] ?? 2, Int($0.labels["order"] ?? "") ?? .max, $0.group) }
+        let sorted = firsts.map { ($0.labels["pinned"] == nil ? 1 : 0, states[$0.group] ?? 2, Int($0.labels["order"] ?? "") ?? .max, $0.group) }
             .sorted { ($0.0, $0.1, $0.2) < ($1.0, $1.1, $1.2) }.map(\.3)
+        return sorted.reduce(into: [String]()) { clustered, group in
+            guard !clustered.contains(group) else { return }
+            clustered += folder(of: group).map { name in sorted.filter { self.folder(of: $0) == name } } ?? [group]
+        }
     }
 
-    private func peers(_ group: String) -> [String] {
-        let pinned = { (group: String) in self.tabs.first { $0.group == group }?.labels["pinned"] != nil }
-        return groups.filter { pinned($0) == pinned(group) }
+    private enum Entry: Equatable { case folder(String), group(String) }
+
+    private var sidebarEntries: [Entry] {
+        groups.reduce(into: []) { entries, group in
+            guard let name = folder(of: group) else { return entries.append(.group(group)) }
+            if !entries.contains(.folder(name)) { entries.append(.folder(name)) }
+            if !collapsed.contains(name) { entries.append(.group(group)) }
+        }
+    }
+
+    private var visibleGroups: [String] { sidebarEntries.compactMap { entry -> String? in if case .group(let group) = entry { return group }; return nil } }
+
+    private var folders: [String] { sidebarEntries.compactMap { entry -> String? in if case .folder(let name) = entry { return name }; return nil } }
+
+    private func folder(of group: String) -> String? { tabs.first { $0.group == group }?.labels["folder"] }
+
+    private func members(of name: String) -> [String] { groups.filter { folder(of: $0) == name } }
+
+    private func isPinned(_ group: String) -> Bool { tabs.first { $0.group == group }?.labels["pinned"] != nil }
+
+    private func isPinned(_ entry: Entry) -> Bool {
+        switch entry {
+        case .group(let group): return isPinned(group)
+        case .folder(let name): return members(of: name).first.map(isPinned) ?? false
+        }
+    }
+
+    private func blocks(pinned: Bool) -> [[String]] {
+        groups.filter { isPinned($0) == pinned }.reduce(into: []) { blocks, group in
+            if let name = folder(of: group), let last = blocks.last?.last, folder(of: last) == name { blocks[blocks.count - 1].append(group) } else { blocks.append([group]) }
+        }
+    }
+
+    private func writeOrder(_ order: [String]) {
+        for (index, group) in order.enumerated() where tabs.first(where: { $0.group == group })?.labels["order"] != String(index) { label(group, "order", String(index)) }
     }
 
     private func rebuild() {
@@ -1809,26 +1853,15 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         activities = [:]
         tabSparks = [:]
         meters = [:]
-        sidebar.setViews(groups.map { group in
-            let groupTabs = tabs.filter { $0.group == group }
-            let pinned = groupTabs[0].labels["pinned"] != nil
-            let sparks = activity(groupTabs).map { activity in
-                let view = ActivityView(selected: group == selected.group, single: activity.sparks.count == 1, width: sidebarWidth - 36, open: { [unowned self] name in tabs.first { $0.name == name }.map(select) }) { [unowned self] in agentsMenu(groupTabs) }
-                view.show(activity)
-                activities[group] = view
-                return view
+        groupRows = []
+        folderRows = [:]
+        sidebar.setViews(sidebarEntries.map { entry in
+            switch entry {
+            case .folder(let name): return folderRow(name, selected: selected)
+            case .group(let group): return groupRow(group, selected: selected)
             }
-            let row = Row(title(group), icon: pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Pinned") : nil, activity: sparks, detail:place(groupTabs[0].folder), bar: colors.first { $0.name == groupTabs[0].labels["color"] }?.color, selected: group == selected.group, fill: .controlAccentColor,
-                          close: { [unowned self] in closing(group: group) }) { [unowned self] in
-                select(group: group)
-            }
-            row.contextMenu = { [unowned self] in groupMenu(group, pinned: pinned) }
-            row.rename = { [unowned self] in rename(group) }
-            row.lane = pinned ? "pinned" : "groups"
-            row.dropped = { [unowned self] to in reorder(group, to: to) }
-            return row
         }, in: .top)
-        for row in sidebar.views { row.widthAnchor.constraint(equalTo: sidebar.widthAnchor).isActive = true }
+        for row in sidebar.views { row.widthAnchor.constraint(equalTo: sidebar.widthAnchor, constant: groupRows.contains { $0.row === row && folder(of: $0.group) != nil } ? -Self.folderIndent : 0).isActive = true }
         let folderIcon = NSWorkspace.shared.icon(forFile: selected.folder)
         window.title = title(selected.group)
         let named = named(selected.group) || tabs.count(where: { $0.group == selected.group }) > 1
@@ -1888,7 +1921,8 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         lookAt()
         if hidden { menuBarIcon() }
         groupsMenu.removeAllItems()
-        for (index, group) in groups.enumerated() { groupItem(group, at: index, in: groupsMenu) }
+        let visible = visibleGroups
+        for group in groups { groupItem(group, in: groupsMenu, visible: visible) }
         groupsMenu.addItem(.separator())
         let paneTabs = tabs.filter { $0.group == selected.group && pane(of: $0, in: layout) == focused }
         for (index, tab) in paneTabs.enumerated() {
@@ -1905,6 +1939,140 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             groupsMenu.addItem(last)
         }
         if !pills.isEmpty { showHints() }
+    }
+
+    private func groupRow(_ group: String, selected: Tab) -> Row {
+        let groupTabs = tabs.filter { $0.group == group }
+        let pinned = groupTabs[0].labels["pinned"] != nil
+        let indent = folder(of: group) == nil ? 0 : Self.folderIndent
+        let sparks = activity(groupTabs).map { activity in
+            let view = ActivityView(selected: group == selected.group, single: activity.sparks.count == 1, width: sidebarWidth - 36 - indent, open: { [unowned self] name in tabs.first { $0.name == name }.map(select) }) { [unowned self] in agentsMenu(groupTabs) }
+            view.show(activity)
+            activities[group] = view
+            return view
+        }
+        let row = Row(title(group), icon: pinned ? NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Pinned") : nil, activity: sparks, detail: place(groupTabs[0].folder), bar: colors.first { $0.name == groupTabs[0].labels["color"] }?.color, selected: group == selected.group, fill: .controlAccentColor,
+                      close: { [unowned self] in closing(group: group) }) { [unowned self] in
+            select(group: group)
+        }
+        row.contextMenu = { [unowned self] in groupMenu(group, pinned: pinned) }
+        row.rename = { [unowned self] in rename(group) }
+        row.lane = pinned ? "pinned" : "groups"
+        row.dropped = { [unowned self] to in drop(.group(group), at: to) }
+        row.mergeable = folder(of: group) == nil
+        row.merged = { [unowned self] target in groupRows.first { $0.row === target }.map { merge(group, into: $0.group) } }
+        groupRows.append((group, row))
+        return row
+    }
+
+    private func folderRow(_ name: String, selected: Tab) -> Row {
+        let inside = members(of: name), folded = collapsed.contains(name)
+        let waiting = tabs.contains { inside.contains($0.group) && $0.claude == "waiting" }
+        let chevron = NSImage(systemSymbolName: folded ? "chevron.right" : "chevron.down", accessibilityDescription: folded ? "Collapsed" : "Expanded")
+        let shades = Set(inside.map { group in tabs.first { $0.group == group }?.labels["color"] ?? "" })
+        let row = Row(name, icon: chevron, spark: waiting ? Spark("waiting", phase: 0, selected: false, mark: "blocked") : nil, meter: NSTextField(labelWithString: String(inside.count)),
+                      bar: shades.count == 1 ? colors.first { $0.name == shades.first }?.color : nil,
+                      selected: folded && inside.contains(selected.group), fill: Row.pickFill) { [unowned self] in toggle(folder: name) }
+        row.clicksOnRelease = true
+        row.renamesOnTitle = true
+        row.lane = inside.first.map(isPinned) == true ? "pinned" : "groups"
+        row.dropped = { [unowned self] to in drop(.folder(name), at: to) }
+        row.contextMenu = { [unowned self] in folderMenu(name) }
+        row.rename = { [unowned self] in toggle(folder: name); rename(folder: name) }
+        folderRows[name] = row
+        return row
+    }
+
+    private func toggle(folder name: String) {
+        if collapsed.remove(name) == nil { collapsed.insert(name) }
+        saveSoon()
+        rebuild()
+    }
+
+    private func drop(_ entry: Entry, at place: Int) {
+        let pinned = isPinned(entry)
+        var entries = sidebarEntries.filter { isPinned($0) == pinned && $0 != entry }
+        let place = min(place, entries.count)
+        entries.insert(entry, at: place)
+        switch entry {
+        case .group(let group):
+            let below = place + 1 < entries.count ? entries[place + 1] : nil
+            let into: String? = switch place == 0 ? nil : entries[place - 1] {
+            case .folder(let name)?: collapsed.contains(name) ? nil : name
+            case .group(let other)?: folder(of: other).flatMap { name in folder(of: group) == name || below.flatMap(folder(holding:)) == name ? name : nil }
+            case nil: nil
+            }
+            if folder(of: group) != into { label(group, "folder", into ?? "") }
+        case .folder(let name):
+            let inside = members(of: name)
+            entries.removeAll { if case .group(let group) = $0 { return inside.contains(group) }; return false }
+        }
+        writeOrder(entries.flatMap { item -> [String] in
+            switch item {
+            case .group(let group): return [group]
+            case .folder(let name): return item == entry || collapsed.contains(name) ? members(of: name) : []
+            }
+        }.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } })
+        rebuild()
+    }
+
+    private func merge(_ group: String, into target: String) {
+        guard group != target, folder(of: target) == nil, isPinned(group) == isPinned(target) else { return }
+        let name = Self.unused("Folder", Set(folders)), left = folder(of: group)
+        let orders = groups.map { group in (group, tabs.first { $0.group == group }?.labels["order"] ?? "") }
+        var order = groups.filter { isPinned($0) == isPinned(target) && $0 != group }
+        order.insert(group, at: order.firstIndex(of: target)! + 1)
+        slide(revealing: name) {
+            label(target, "folder", name)
+            label(group, "folder", name)
+            writeOrder(order)
+            collapsed.remove(name)
+            rebuild()
+        }
+        rename(folder: name) { [unowned self] in
+            guard let joined = folder(of: target), folder(of: group) == joined else { return rebuild() }
+            slide {
+                label(target, "folder", "")
+                label(group, "folder", left ?? "")
+                for (group, order) in orders where tabs.contains(where: { $0.group == group }) && (tabs.first { $0.group == group }?.labels["order"] ?? "") != order { label(group, "order", order) }
+                rebuild()
+            }
+        }
+    }
+
+    private func slide(revealing name: String? = nil, _ change: () -> Void) {
+        let before = Dictionary(groupRows.map { ($0.group, $0.row.convert($0.row.bounds, to: nil)) }) { first, _ in first }
+        change()
+        window.contentView?.layoutSubtreeIfNeeded()
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.25)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(controlPoints: 0.32, 0.72, 0, 1))
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            (sidebar.layer ?? window.contentView?.layer)?.add(CATransition(), forKey: "fade")
+        } else {
+            for (group, row) in groupRows {
+                guard let old = before[group], let parent = row.superview else { continue }
+                let from = parent.convert(old, from: nil)
+                let slide = CABasicAnimation(keyPath: "transform.translation")
+                slide.fromValue = NSValue(size: NSSize(width: from.minX - row.frame.minX, height: from.minY - row.frame.minY))
+                slide.toValue = NSValue(size: .zero)
+                row.layer?.add(slide, forKey: "slide")
+            }
+            if let header = name.flatMap({ folderRows[$0] }) {
+                let fade = CABasicAnimation(keyPath: "opacity")
+                fade.fromValue = 0
+                fade.toValue = 1
+                header.layer?.add(fade, forKey: "fade")
+            }
+        }
+        CATransaction.commit()
+    }
+
+    private func folder(holding entry: Entry) -> String? {
+        switch entry {
+        case .folder(let name): return name
+        case .group(let group): return folder(of: group)
+        }
     }
 
     private func place(_ folder: String) -> String {
@@ -2187,14 +2355,132 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         showWindow()
     }
 
+    private func folderItem(_ group: String, filed: String?, pinned: Bool) -> NSMenuItem {
+        let item = NSMenuItem(title: "Move to Folder", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "Move to Folder")
+        for name in folders where members(of: name).first.map(isPinned) == pinned {
+            let entry = submenu.addItem(withTitle: name, action: name == filed ? nil : #selector(fileGroup), keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = (group, name)
+            entry.state = name == filed ? .on : .off
+        }
+        if !submenu.items.isEmpty { submenu.addItem(.separator()) }
+        for (title, action) in [("New Folder…", #selector(newFolder)), ("Remove from Folder", filed == nil ? nil : #selector(unfileGroup))] as [(String, Selector?)] {
+            let entry = submenu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = group
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    @objc private func fileGroup(_ item: NSMenuItem) {
+        let (group, name) = item.representedObject as! (String, String)
+        label(group, "folder", name)
+        rebuild()
+    }
+
+    @objc private func unfileGroup(_ item: NSMenuItem) {
+        label(item.representedObject as! String, "folder", "")
+        rebuild()
+    }
+
+    @objc private func newFolder(_ item: NSMenuItem) {
+        let group = item.representedObject as! String, name = Self.unused("Folder", Set(folders)), left = folder(of: group)
+        label(group, "folder", name)
+        collapsed.remove(name)
+        rebuild()
+        rename(folder: name) { [unowned self] in
+            label(group, "folder", left ?? "")
+            rebuild()
+        }
+    }
+
+    private func folderMenu(_ name: String) -> NSMenu {
+        let menu = NSMenu()
+        let add = { (title: String, action: Selector?, object: Any?) in
+            let item = title == "-" ? NSMenuItem.separator() : NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = object
+            menu.addItem(item)
+        }
+        let inside = members(of: name)
+        guard let first = inside.first else { return menu }
+        let pinned = isPinned(first)
+        add(collapsed.contains(name) ? "Expand Folder" : "Collapse Folder", #selector(toggleFolder), name)
+        add("Rename Folder", #selector(renameFolder), name)
+        add(pinned ? "Unpin Folder" : "Pin Folder", #selector(pinGroups), (inside, pinned ? "" : "1"))
+        add("-", nil, nil)
+        let sorting = UserDefaults.standard.bool(forKey: Self.sortKey)
+        let order = blocks(pinned: pinned)
+        if let index = order.firstIndex(of: inside) {
+            for (title, to) in [("Move Up", index - 1), ("Move Down", index + 1), ("Move to Top", 0)] {
+                add(title, sorting || to == index || !order.indices.contains(to) ? nil : #selector(moveFolder), (name, to))
+            }
+        }
+        add("-", nil, nil)
+        add("Ungroup Folder", #selector(ungroupFolder), name)
+        add("Close Folder", #selector(closeFolder), name)
+        return menu
+    }
+
+    @objc private func toggleFolder(_ item: NSMenuItem) { toggle(folder: item.representedObject as! String) }
+
+    @objc private func renameFolder(_ item: NSMenuItem) { rename(folder: item.representedObject as! String) }
+
+    @objc private func moveFolder(_ item: NSMenuItem) {
+        let (name, to) = item.representedObject as! (String, Int)
+        move(block: members(of: name), to: to)
+    }
+
+    @objc private func ungroupFolder(_ item: NSMenuItem) {
+        let name = item.representedObject as! String
+        for group in members(of: name) { label(group, "folder", "") }
+        collapsed.remove(name)
+        rebuild()
+    }
+
+    @objc private func closeFolder(_ item: NSMenuItem) {
+        let name = item.representedObject as! String, inside = members(of: name)
+        closing(tabs.filter { inside.contains($0.group) }.map(\.name), title: "Close folder \u{201C}\(name)\u{201D}?", ask: true)
+    }
+
+    private func rename(folder name: String, untouched: (() -> Void)? = nil) {
+        guard let row = folderRows[name] else { return }
+        renaming = true
+        row.edit({ [unowned self] text in
+            let new = Self.oneWord(text)
+            if new.isEmpty { return "A folder needs a name." }
+            guard new != name, let other = members(of: new).first, let mine = members(of: name).first, isPinned(other) != isPinned(mine) else { return nil }
+            return isPinned(other) ? "A pinned folder is named \(new)." : "An unpinned folder is named \(new)."
+        }) { [unowned self] text in
+            renaming = false
+            if text == nil, !row.typed, let untouched {
+                untouched()
+            } else {
+                if let new = text.map(Self.oneWord), !new.isEmpty, new != name {
+                    for group in members(of: name) { label(group, "folder", new) }
+                    let folded = collapsed.remove(name) != nil
+                    collapsed.remove(new)
+                    if folded { collapsed.insert(new) }
+                    saveSoon()
+                }
+                rebuild()
+            }
+            window.makeFirstResponder(selected.flatMap { surfaces[$0.name] })
+        }
+    }
+
     private func groupMenu(_ group: String, pinned: Bool) -> NSMenu {
         let menu = NSMenu()
-        let pin = menu.addItem(withTitle: pinned ? "Unpin Group" : "Pin Group", action: #selector(setLabel), keyEquivalent: "")
+        let filed = folder(of: group)
+        let pin = menu.addItem(withTitle: (pinned ? "Unpin " : "Pin ") + (filed == nil ? "Group" : "Folder"), action: #selector(pinGroups), keyEquivalent: "")
         pin.target = self
-        pin.representedObject = [group, "pinned", pinned ? "" : "1"]
+        pin.representedObject = (filed.map { members(of: $0) } ?? [group], pinned ? "" : "1")
         let rename = menu.addItem(withTitle: "Rename Group", action: #selector(renameGroup), keyEquivalent: "R")
         rename.target = self
         rename.representedObject = group
+        menu.addItem(folderItem(group, filed: filed, pinned: pinned))
         menu.addItem(.separator())
         let current = tabs.first { $0.group == group }?.labels["color"]
         let circles = NSStackView(views: ([("none", nil)] + colors.map { ($0.name, Optional($0.color)) }).enumerated().map { index, choice in
@@ -2213,10 +2499,10 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         colorItem.representedObject = group
         menu.addItem(.separator())
         let sorting = UserDefaults.standard.bool(forKey: Self.sortKey)
-        let order = peers(group)
+        let order = filed.map { members(of: $0) } ?? blocks(pinned: pinned).map { $0[0] }
         let index = order.firstIndex(of: group)!
         for (title, to) in [("Move Up", index - 1), ("Move Down", index + 1), ("Move to Top", 0)] {
-            let item = menu.addItem(withTitle: title, action: sorting || to == index || !order.indices.contains(to) ? nil : #selector(move), keyEquivalent: "")
+            let item = menu.addItem(withTitle: title, action: sorting || to == index || !order.indices.contains(to) ? nil : #selector(move(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = (group, to)
         }
@@ -2245,13 +2531,29 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
 
     @objc private func move(_ item: NSMenuItem) {
         let (group, to) = item.representedObject as! (String, Int)
-        reorder(group, to: to)
+        folder(of: group) == nil ? move(block: [group], to: to) : move(member: group, to: to)
     }
 
-    private func reorder(_ group: String, to: Int) {
-        var order = peers(group).filter { $0 != group }
-        order.insert(group, at: to)
-        for (index, peer) in order.enumerated() where tabs.first(where: { $0.group == peer })?.labels["order"] != String(index) { label(peer, "order", String(index)) }
+    private func move(block: [String], to: Int) {
+        var all = blocks(pinned: isPinned(block[0])).filter { $0 != block }
+        all.insert(block, at: to)
+        writeOrder(all.flatMap { $0 })
+        rebuild()
+    }
+
+    private func move(member group: String, to: Int) {
+        writeOrder(blocks(pinned: isPinned(group)).flatMap { block -> [String] in
+            guard block.contains(group) else { return block }
+            var inside = block.filter { $0 != group }
+            inside.insert(group, at: min(to, inside.count))
+            return inside
+        })
+        rebuild()
+    }
+
+    @objc private func pinGroups(_ item: NSMenuItem) {
+        let (names, value) = item.representedObject as! ([String], String)
+        for name in names { label(name, "pinned", value) }
         rebuild()
     }
 
@@ -2343,14 +2645,14 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
             return true
         }
         guard under(scroll) else { return false }
-        if let group = zip(groups, sidebar.arrangedSubviews).first(where: { under($0.1) })?.0 { return group != tab.group && regroup(name, to: group) }
+        if let group = groupRows.first(where: { under($0.row) })?.group { return group != tab.group && regroup(name, to: group) }
         guard tabs.contains(where: { $0.group == tab.group && $0 != tab }) else { return false }
         return regroup(name, to: Self.unused(name, takenNames().subtracting([name]).union(groups)))
     }
 
     private func regroup(_ name: String, to group: String) -> Bool {
         let tab = tabs.first { $0.name == name }!, source = tab.group, target = tabs.first { $0.group == group }
-        var wanted = (target?.labels ?? ["named": "0"]).filter { ["color", "pinned", "order", "split", "named"].contains($0.key) }
+        var wanted = (target?.labels ?? ["named": "0"]).filter { ["color", "pinned", "order", "split", "named", "folder"].contains($0.key) }
         wanted["pane"] = target.map { pane(of: tabs.first { $0 == lastTab[group] } ?? $0) }
         wanted["title"] = tab.labels["title"]
         guard label(source, "group", group, tab: name) else { NSSound.beep(); return false }
@@ -2396,12 +2698,6 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         }
     }
 
-    @objc private func setLabel(_ item: NSMenuItem) {
-        let label = item.representedObject as! [String]
-        self.label(label[0], label[1], label[2])
-        rebuild()
-    }
-
     @discardableResult private func label(_ group: String, _ key: String, _ value: String, tab: String? = nil) -> Bool {
         var all = true
         for index in tabs.indices where tabs[index].group == group && (tab == nil || tabs[index].name == tab) {
@@ -2423,11 +2719,12 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     @objc private func renameSelected() {
         guard let selected else { return }
         if !sidebarShown { toggleSidebar() }
+        if let name = folder(of: selected.group), collapsed.remove(name) != nil { rebuild() }
         rename(selected.group)
     }
 
     private func rename(_ group: String) {
-        guard let row = zip(groups, sidebar.views).first(where: { $0.0 == group })?.1 as? Row else { return }
+        guard let row = groupRows.first(where: { $0.group == group })?.row else { return }
         let shown = title(group)
         renaming = true
         row.edit({ [unowned self] text in
@@ -2615,7 +2912,7 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private static func sessions() -> [Tab] {
         let found = list().compactMap { fields -> (Int, Tab)? in
             guard let name = fields["name"], let group = fields["group"] else { return nil }
-            return (Int(fields["created"] ?? "") ?? 0, Tab(name: name, group: group, cwd: URL(string: fields["cwd"] ?? "")?.path ?? NSHomeDirectory(), labels: fields.filter { ["color", "pinned", "order", "split", "pane", "title", "rank", "notify", "named"].contains($0.key) }, pid: fields["pid"].flatMap(Int32.init), topic: try? String(contentsOfFile: statusDir + "/" + name + ".topic", encoding: .utf8)))
+            return (Int(fields["created"] ?? "") ?? 0, Tab(name: name, group: group, cwd: URL(string: fields["cwd"] ?? "")?.path ?? NSHomeDirectory(), labels: fields.filter { ["color", "pinned", "order", "split", "pane", "title", "rank", "notify", "named", "folder"].contains($0.key) }, pid: fields["pid"].flatMap(Int32.init), topic: try? String(contentsOfFile: statusDir + "/" + name + ".topic", encoding: .utf8)))
         }.sorted { $0.0 < $1.0 }.map(\.1)
         let first = Dictionary(found.enumerated().map { ($1.group, $0) }, uniquingKeysWith: { first, _ in first })
         return found.map { (first[$0.group]!, Int($0.labels["rank"] ?? "") ?? .max, $0) }.sorted { ($0.0, $0.1) < ($1.0, $1.1) }.map(\.2)
@@ -3399,6 +3696,12 @@ final class Row: NSView, NSTextFieldDelegate {
     var lane: String?
     var dropped: ((Int) -> Void)?
     var carried: ((NSPoint) -> Bool)?
+    var merged: ((Row) -> Void)?
+    var mergeable = false
+    var clicksOnRelease = false
+    var renamesOnTitle = false
+    private(set) var typed = false
+    private var dragged = false
     static var lifted: Row?
     var ghost: NSImageView?
     private let titleLabel: NSTextField
@@ -3522,7 +3825,14 @@ final class Row: NSView, NSTextFieldDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func mouseDown(with event: NSEvent) {
-        guard event.clickCount == 2, let rename else {
+        if let editor = window?.firstResponder as? NSTextView, (editor.delegate as? NSTextField)?.delegate is Row { window?.makeFirstResponder(nil) }
+        let onTitle = !renamesOnTitle || titleLabel.convert(titleLabel.bounds, to: self).contains(convert(event.locationInWindow, from: nil))
+        guard event.clickCount == 2, onTitle, let rename else {
+            if clicksOnRelease {
+                dragged = false
+                drag(from: event)
+                return dragged ? () : action()
+            }
             let stack = superview as? NSStackView, index = stack?.arrangedSubviews.firstIndex(of: self)
             action()
             return (index.flatMap { stack?.arrangedSubviews[$0] } as? Row)?.drag(from: event) ?? ()
@@ -3545,10 +3855,10 @@ final class Row: NSView, NSTextFieldDelegate {
         let band = { (past: Double) in half * past / (past + half * 3) }
         let origin = along(stack.convert(NSPoint.zero, to: nil))
         var place = from, point = down.locationInWindow, out = false
-        var over: Row?
-        var tick: Date?
+        var over: Row?, held: Row?, merging = false
+        var tick: Date?, due: Date?, heldAt = point
         while true {
-            let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp], until: tick ?? .distantFuture, inMode: .eventTracking, dequeue: true)
+            let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp], until: [tick, due].compactMap { $0 }.min() ?? .distantFuture, inMode: .eventTracking, dequeue: true)
             point = event?.locationInWindow ?? point
             guard event?.type != .leftMouseUp else { break }
             let drift = along(stack.convert(NSPoint.zero, to: nil)) - origin
@@ -3568,6 +3878,7 @@ final class Row: NSView, NSTextFieldDelegate {
                 stack.addSubview(ghost!)
                 alphaValue = 0
                 Row.lifted = self
+                dragged = true
             }
             let under = carried == nil ? nil : root.superview.flatMap { root.hitTest($0.convert(point, from: nil)) }
             let otherBar = under.flatMap { sequence(first: $0, next: \.superview).first { $0 is PaneBar } }.map { $0 !== stack } ?? false
@@ -3592,7 +3903,10 @@ final class Row: NSView, NSTextFieldDelegate {
                 let point = stack.convert(vertical ? NSPoint(x: centre.x, y: -(at + drift)) : NSPoint(x: at + drift, y: centre.y), from: nil)
                 ghost!.frame = NSRect(x: point.x - bounds.width / 2, y: point.y - bounds.height / 2, width: bounds.width, height: bounds.height)
             }
-            let target = (out ? under : nil).flatMap { sequence(first: $0, next: \.superview).lazy.compactMap { $0 as? Row }.first { $0.detail != nil && !$0.isAccessibilitySelected() } }
+            let aim = merged == nil || out ? nil : rows.lazy.compactMap { $0 as? Row }.first { $0 !== self && $0.mergeable && $0.frame.contains(NSPoint(x: self.ghost!.frame.midX, y: self.ghost!.frame.midY)) }
+            if aim !== held || hypot(point.x - heldAt.x, point.y - heldAt.y) > 4 { (held, heldAt, due, merging) = (aim, point, aim.map { _ in Date() + 0.5 }, false) }
+            if let deadline = due, deadline <= Date() { (due, merging) = (nil, true) }
+            let target = merging ? held : (out ? under : nil).flatMap { sequence(first: $0, next: \.superview).lazy.compactMap { $0 as? Row }.first { $0.detail != nil && !$0.isAccessibilitySelected() } }
             if target !== over {
                 over?.layer?.borderWidth = 0
                 target?.layer?.borderWidth = 2
@@ -3614,7 +3928,7 @@ final class Row: NSView, NSTextFieldDelegate {
             self.ghost = nil
             alphaValue = 1
             Row.lifted = nil
-            dropped?(place)
+            if merging, let held { merged?(held) } else { dropped?(place) }
         }
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = slide
@@ -3641,6 +3955,7 @@ final class Row: NSView, NSTextFieldDelegate {
     func edit(_ problem: @escaping (String) -> String?, done: @escaping (String?) -> Void) {
         self.problem = problem
         renamed = done
+        typed = false
         titleLabel.isEditable = true
         titleLabel.delegate = self
         if detail != nil {
@@ -3654,6 +3969,7 @@ final class Row: NSView, NSTextFieldDelegate {
     }
 
     func controlTextDidChange(_ obj: Notification) {
+        typed = true
         detailLabel?.stringValue = problem?(titleLabel.stringValue) ?? detail ?? ""
         fitTyped()
     }
@@ -3950,7 +4266,9 @@ final class Spark: NSButton {
     let lines = ["at \(Int(anchor.x)) \(Int(anchor.y))"] + menu.items.map { item in
         if item.isSeparatorItem { return "-" }
         if let view = item.view, !view.subviews.isEmpty { return view.subviews.map { "button " + ($0.accessibilityLabel() ?? "") }.joined(separator: "\n") }
+        item.submenu?.update()
         return item.title + (item.keyEquivalent.isEmpty ? "" : " ⌘" + item.keyEquivalent) + (item.state == .on ? " ✓" : "") + (item.isEnabled ? "" : " (off)") + (item.subtitle.map { " [\($0)]" } ?? "")
+            + (item.submenu.map { " ▸ " + $0.items.map { $0.isSeparatorItem ? "-" : $0.title + ($0.state == .on ? " ✓" : "") + ($0.isEnabled ? "" : " (off)") }.joined(separator: " | ") } ?? "")
     }
     try? lines.joined(separator: "\n").write(toFile: probe + "/menu", atomically: true, encoding: .utf8)
     let views = menu.items.compactMap { item in item.view is GroupEntry ? item.view : item.attributedTitle.map { text in
@@ -3982,7 +4300,9 @@ final class Spark: NSButton {
     }
     guard let pick = try? String(contentsOfFile: probe + "/pick", encoding: .utf8).trimmingCharacters(in: .newlines) else { return true }
     try? FileManager.default.removeItem(atPath: probe + "/pick")
-    if let index = menu.items.firstIndex(where: { $0.title == pick && $0.isEnabled }) { menu.performActionForItem(at: index) }
+    let path = pick.components(separatedBy: "\t")
+    guard let target = path.dropLast().reduce(Optional(menu), { menu, title in menu?.items.first { $0.title == title }?.submenu }) else { return true }
+    if let index = target.items.firstIndex(where: { $0.title == path.last && $0.isEnabled }) { target.performActionForItem(at: index) }
     (menu.items.compactMap(\.view).flatMap(\.subviews).first { $0.accessibilityLabel() == pick } as? NSButton)?.performClick(nil)
     return true
 }

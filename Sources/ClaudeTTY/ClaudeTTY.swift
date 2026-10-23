@@ -1995,7 +1995,12 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
         entries.insert(entry, at: place)
         switch entry {
         case .group(let group):
-            let into = place == 0 ? nil : folder(holding: entries[place - 1])
+            let below = place + 1 < entries.count ? entries[place + 1] : nil
+            let into: String? = switch place == 0 ? nil : entries[place - 1] {
+            case .folder(let name)?: name
+            case .group(let other)?: folder(of: other).flatMap { name in folder(of: group) == name || below.flatMap(folder(holding:)) == name ? name : nil }
+            case nil: nil
+            }
             if folder(of: group) != into { label(group, "folder", into ?? "") }
         case .folder(let name):
             let inside = members(of: name)

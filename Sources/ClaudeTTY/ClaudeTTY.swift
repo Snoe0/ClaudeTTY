@@ -4228,7 +4228,7 @@ final class Spark: NSButton {
     guard let pick = try? String(contentsOfFile: probe + "/pick", encoding: .utf8).trimmingCharacters(in: .newlines) else { return true }
     try? FileManager.default.removeItem(atPath: probe + "/pick")
     let path = pick.components(separatedBy: "\t")
-    let target = path.dropLast().reduce(Optional(menu)) { menu, title in menu?.items.first { $0.title == title }?.submenu } ?? menu
+    guard let target = path.dropLast().reduce(Optional(menu), { menu, title in menu?.items.first { $0.title == title }?.submenu }) else { return true }
     if let index = target.items.firstIndex(where: { $0.title == path.last && $0.isEnabled }) { target.performActionForItem(at: index) }
     (menu.items.compactMap(\.view).flatMap(\.subviews).first { $0.accessibilityLabel() == pick } as? NSButton)?.performClick(nil)
     return true

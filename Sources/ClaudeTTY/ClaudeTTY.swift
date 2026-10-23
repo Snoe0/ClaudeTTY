@@ -250,6 +250,8 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
     private var pills: [KeyPill] = []
     private var paneRows: [Row] = []
     private var groupRows: [(group: String, row: Row)] = []
+    private var undoItem: NSMenuItem?
+    private var undoMerge: (() -> Void)?
     private var folderRows: [String: Row] = [:]
     private static let folderIndent: CGFloat = 12
     private var hintModifier = "⌘"
@@ -2018,15 +2020,76 @@ final class ClaudeTTY: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenu
 
     private func merge(_ group: String, into target: String) {
         guard group != target, folder(of: target) == nil, isPinned(group) == isPinned(target) else { return }
-        let name = Self.unused("Folder", Set(folders))
+        let name = Self.unused("Folder", Set(folders)), left = folder(of: group)
+        let orders = groups.map { group in (group, tabs.first { $0.group == group }?.labels["order"] ?? "") }
         var order = groups.filter { isPinned($0) == isPinned(target) && $0 != group }
         order.insert(group, at: order.firstIndex(of: target)! + 1)
-        label(target, "folder", name)
-        label(group, "folder", name)
-        writeOrder(order)
-        collapsed.remove(name)
-        rebuild()
+        slide(revealing: name) {
+            label(target, "folder", name)
+            label(group, "folder", name)
+            writeOrder(order)
+            collapsed.remove(name)
+            rebuild()
+        }
         rename(folder: name)
+        offerUndo { [unowned self] in
+            window.makeFirstResponder(nil)
+            guard let joined = folder(of: target), folder(of: group) == joined else { return }
+            slide {
+                label(target, "folder", "")
+                label(group, "folder", left ?? "")
+                for (group, order) in orders where tabs.contains(where: { $0.group == group }) && (tabs.first { $0.group == group }?.labels["order"] ?? "") != order { label(group, "order", order) }
+                rebuild()
+            }
+        }
+    }
+
+    private func slide(revealing name: String? = nil, _ change: () -> Void) {
+        let before = Dictionary(groupRows.map { ($0.group, $0.row.convert($0.row.bounds, to: nil)) }) { first, _ in first }
+        change()
+        window.contentView?.layoutSubtreeIfNeeded()
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.25)
+        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(controlPoints: 0.32, 0.72, 0, 1))
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            (sidebar.layer ?? window.contentView?.layer)?.add(CATransition(), forKey: "fade")
+        } else {
+            for (group, row) in groupRows {
+                guard let old = before[group], let parent = row.superview else { continue }
+                let from = parent.convert(old, from: nil)
+                let slide = CABasicAnimation(keyPath: "transform.translation")
+                slide.fromValue = NSValue(size: NSSize(width: from.minX - row.frame.minX, height: from.minY - row.frame.minY))
+                slide.toValue = NSValue(size: .zero)
+                row.layer?.add(slide, forKey: "slide")
+            }
+            if let header = name.flatMap({ folderRows[$0] }) {
+                let fade = CABasicAnimation(keyPath: "opacity")
+                fade.fromValue = 0
+                fade.toValue = 1
+                header.layer?.add(fade, forKey: "fade")
+            }
+        }
+        CATransaction.commit()
+    }
+
+    private func offerUndo(_ undo: @escaping () -> Void) {
+        withdrawUndo()
+        let item = NSMenuItem(title: "Undo New Folder", action: #selector(performUndo), keyEquivalent: "z")
+        item.target = self
+        NSApp.mainMenu?.items.first { $0.submenu?.title == "Edit" }?.submenu?.insertItem(item, at: 0)
+        (undoItem, undoMerge) = (item, undo)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak item] in if let item, self?.undoItem === item { self?.withdrawUndo() } }
+    }
+
+    private func withdrawUndo() {
+        undoItem?.menu?.removeItem(undoItem!)
+        (undoItem, undoMerge) = (nil, nil)
+    }
+
+    @objc private func performUndo() {
+        let undo = undoMerge
+        withdrawUndo()
+        undo?()
     }
 
     private func folder(holding entry: Entry) -> String? {
